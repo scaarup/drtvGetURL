@@ -1,0 +1,4 @@
+sensor:
+  - platform: command_line
+    name: SenesteTvAvis
+    command: "python /config/scripts/drGetLatestURL.py 'TV AVISEN'"
