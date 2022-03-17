@@ -25,17 +25,17 @@ import hashlib
 import json
 from math import ceil
 import os
-import pickle
+#import pickle
 import re
-import requests
-import requests_cache
+#import requests
+#import requests_cache
 import struct
 import sys
 
 """
 import xbmc
 import xbmcaddon
-
+"""
 if sys.version_info.major == 2:
     # python 2
     compat_str = unicode
@@ -43,6 +43,7 @@ if sys.version_info.major == 2:
 else:
     compat_str = str
     import urllib.parse as urlparse
+"""
 ADDON = xbmcaddon.Addon()
 tr = xbmcaddon.Addon().getLocalizedString
 """
