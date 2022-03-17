@@ -1,5 +1,5 @@
 #
-#      Copyright (C) 2014 Tommy Winther, msj33
+#      Copyright (C) 2014 Tommy Winther, msj33, TermeHansen
 #
 #  https://github.com/xbmc-danish-addons/plugin.video.drnu
 #
@@ -19,23 +19,33 @@
 #  http://www.gnu.org/copyleft/gpl.html
 #
 
-try:
-    import json
-except:
-    import simplejson as json
-#import urllib
-#import urllib2
-import hashlib
+import base64
 import binascii
-import struct
+import hashlib
+import json
 from math import ceil
 import os
-#import datetime
-#import re
-#import base64
-#import xbmcaddon
+import pickle
+import re
+import requests
+import requests_cache
+import struct
+import sys
 
-#ADDON = xbmcaddon.Addon()
+"""
+import xbmc
+import xbmcaddon
+
+if sys.version_info.major == 2:
+    # python 2
+    compat_str = unicode
+    import urllib as urlparse
+else:
+    compat_str = str
+    import urllib.parse as urlparse
+ADDON = xbmcaddon.Addon()
+tr = xbmcaddon.Addon().getLocalizedString
+"""
 
 SLUG_PREMIERES='forpremierer'
 SLUG_ADULT=['dr1','dr2','dr3','dr-k']
@@ -45,17 +55,24 @@ class Api(object):
 
     def __init__(self, cachePath):
         self.cachePath = cachePath
+        #cache expires after: 3600 = 1hour
+        requests_cache.install_cache(os.path.join(cachePath,'requests.cache'), backend='sqlite', expire_after=3600*8 )
+        requests_cache.remove_expired_responses()
+        self.empty_srt = compat_str('{}/{}.da.srt').format(self.cachePath, tr(30508))
+        with open(self.empty_srt, 'w') as fn:
+           fn.write('1\n00:00:00,000 --> 00:01:01,000\n') # we have to have something in srt to make kodi use it
 
     def getLiveTV(self):
-        return self._http_request('/channel/all-active-dr-tv-channels')
+        channels = self._http_request('/channel/all-active-dr-tv-channels')
+        return [channel for channel in channels if channel['Title'] in ['DR1', 'DR2', 'DR Ramasjang']]
 
     def getChildrenFrontItems(self, channel):
-        childrenFront = self._http_request('/page/tv/children/front/%s' % channel)
+        childrenFront = self._http_request('/page/tv/children/front/{}'.format(channel))
         return self._handle_paging(childrenFront['Programs'])
 
     def getThemes(self):
-        themes = self._http_request('/list/view/themesoverview')
-        return themes['Items']
+        themes = self._http_request('/page/tv/themes', {'themenamesonly': 'false'})
+        return themes['Themes']
 
     def getLatestPrograms(self):
         channel = ''
@@ -66,7 +83,7 @@ class Api(object):
             'orderBy': 'LastPrimaryBroadcastWithPublicAsset',
             'orderDescending': 'true',
             'channel': channel
-        }, cacheMinutes=5)
+        }, cache=False)
         return result['Programs']['Items']
 
     def getProgramIndexes(self):
@@ -80,27 +97,25 @@ class Api(object):
         return []
 
     def getSeries(self, query):
-        result = self._http_request('/search/tv/programcards-latest-episode-with-asset/series-title-starts-with/%s' % query,
+        result = self._http_request('/search/tv/programcards-latest-episode-with-asset/series-title-starts-with/{}'.format(query),
                                     {'limit': 75})
         return self._handle_paging(result)
 
     def searchSeries(self, query):
         # Remove various characters that makes the API puke
-        result = self._http_request('/search/tv/programcards-latest-episode-with-asset/series-title/%s' % re.sub('[&()"\'\.!]', '', query))
+        cleaned_query = re.sub('[&()"\'\.!]', '', query)
+        result = self._http_request('/search/tv/programcards-latest-episode-with-asset/series-title/{}'.format(cleaned_query))
         return self._handle_paging(result)
 
     def getEpisodes(self, slug):
-        result = self._http_request('/list/%s' % slug,
-                                    {'limit': 48,
-                                     'expanded': True})
+        result = self._http_request('/list/{}'.format(slug), {'limit': 48, 'expanded': True})
         return self._handle_paging(result)
 
     def getEpisode(self, slug):
-        return self._http_request('/programcard/%s' % slug)
+        return self._http_request('/programcard/{}'.format(slug))
 
     def getMostViewed(self):
-        result = self._http_request('/list/view/mostviewed',
-                                    {'limit': 48})
+        result = self._http_request('/list/view/mostviewed', {'limit': 48})
         return result['Items']
 
     def getSelectedList(self):
@@ -117,13 +132,31 @@ class Api(object):
                 uri = link['Uri']
                 if uri == None:
                     uri = link['EncryptedUri']
-                    uri = decrypt_uri(uri)               
+                    uri = decrypt_uri(uri)
                 break
 
         subtitlesUri = None
         if 'SubtitlesList' in result and len(result['SubtitlesList']) > 0:
-            subtitlesUri = result['SubtitlesList'][0]['Uri']
-
+            subtitlesUri=[]
+            foreign = False
+            for sub in result['SubtitlesList']:
+               if 'HardOfHearing' in sub['Type']:
+                   name = compat_str('{}/{}.da.srt').format(self.cachePath, tr(30506))
+               else:
+                   foreign = True
+                   name = compat_str('{}/{}.da.srt').format(self.cachePath, tr(30507))
+               u = requests.get(sub['Uri'], timeout=10)
+               if u.status_code != 200:
+                   u.close()
+                   break
+               srt = self.vtt2srt(u.content)
+               with open(name.encode('utf-8'), 'wb') as fn:
+                   fn.write(srt.encode('utf-8'))
+               u.close()
+               subtitlesUri.append(name)
+            if not foreign:
+               # no subtitles, so probably all danish, so we need to set an empty subtitle file as first choice
+               subtitlesUri = [self.empty_srt] + subtitlesUri
         return {
             'Uri': uri,
             'SubtitlesUri': subtitlesUri
@@ -134,7 +167,7 @@ class Api(object):
 	# HACK: the servers behind /mu-online/api/1.2 is often returning Content-Type="text/xml" instead of "image/jpeg",
         # this problem is not pressent for /mu/bar (the "Classic API")
         assert(self.api.API_URL.endswith("/mu-online/api/1.2"))
-        return imageUrl.replace("/mu-online/api/1.2/bar/","/mu/bar/") + "?width=%d&height=%d" % (width, height)
+        return imageUrl.replace("/mu-online/api/1.2/bar/","/mu/bar/") + "?width={:d}&height={:d}".format(width, height)
 
 
     def _handle_paging(self, result):
@@ -144,41 +177,50 @@ class Api(object):
             items.extend(result['Items'])
         return items
 
-    def _http_request(self, url, params=None, cacheMinutes = 720):
+    def _http_request(self, url, params=None, cache=True):
         try:
             if not url.startswith(('http://','https://')):
-                url = self.API_URL + urllib.quote(url, '/')
+                url = self.API_URL + urlparse.quote(url, '/')
 
             if params:
-                url = url + '?' + urllib.urlencode(params, doseq=True)
+                url += '?' + urlparse.urlencode(params, doseq=True)
 
             try:
                 xbmc.log(url)
             except:
                 pass
 
-            urlCachePath = os.path.join(self.cachePath, hashlib.md5(url).hexdigest() + '.cache')
-
-            cacheUntil = datetime.datetime.now() - datetime.timedelta(minutes=cacheMinutes)
-            if not os.path.exists(urlCachePath) or datetime.datetime.fromtimestamp(os.path.getmtime(urlCachePath)) < cacheUntil:
-                u = urllib2.urlopen(url, timeout=30)
-                content = u.read()
-                u.close()
-
-                try:
-                    f = open(urlCachePath, 'w')
-                    f.write(content)
-                    f.close()
-                except:
-                    pass # ignore, cache has no effect
+            if not cache:
+                with requests_cache.disabled():
+                    u = requests.get(url, timeout=30)
             else:
-                f = open(urlCachePath)
-                content = f.read()
-                f.close()
+                u = requests.get(url, timeout=30)
+            if u.status_code == 200:
+                content = u.text
+                u.close()
 
             return json.loads(content)
         except Exception as ex:
             raise ApiException(ex)
+
+    def vtt2srt(self, vtt):
+        if isinstance(vtt, bytes):
+            vtt = vtt.decode('utf-8')
+        srt = vtt.replace("\r\n", "\n")
+        srt = re.sub(r'([\d]+)\.([\d]+)', r'\1,\2', srt)
+        srt = re.sub(r'WEBVTT\n\n', '', srt)
+        srt = re.sub(r'^\d+\n', '', srt)
+        srt = re.sub(r'\n\d+\n', '\n', srt)
+        srt = re.sub(r'\n([\d]+)', r'\nputINDEXhere\n\1', srt)
+
+        srtout = ['1']
+        idx = 2
+        for l in srt.splitlines():
+           if l == 'putINDEXhere':
+               l = str(idx)
+               idx += 1
+           srtout.append(l)
+        return '\n'.join(srtout)
 
 BLOCK_SIZE_BYTES = 16
 
@@ -256,11 +298,6 @@ RIJNDAEL_LOG_TABLE = (0x00, 0x00, 0x19, 0x01, 0x32, 0x02, 0x1a, 0xc6, 0x4b, 0xc7
                       0x44, 0x11, 0x92, 0xd9, 0x23, 0x20, 0x2e, 0x89, 0xb4, 0x7c, 0xb8, 0x26, 0x77, 0x99, 0xe3, 0xa5,
                       0x67, 0x4a, 0xed, 0xde, 0xc5, 0x31, 0xfe, 0x18, 0x0d, 0x63, 0x8c, 0x80, 0xc0, 0xf7, 0x70, 0x07)
 
-try:
-    compat_str = unicode  # Python 2
-except NameError:
-    compat_str = str
-    
 def compat_struct_pack(spec, *args):
     if isinstance(spec, compat_str):
         spec = spec.encode('ascii')
@@ -270,7 +307,7 @@ def compat_struct_unpack(spec, *args):
     if isinstance(spec, compat_str):
         spec = spec.encode('ascii')
     return struct.unpack(spec, *args)
-                      
+
 def mix_column(data, matrix):
     data_mixed = []
     for row in range(4):
@@ -290,12 +327,12 @@ def mix_columns(data, matrix=MIX_COLUMN_MATRIX):
 
 def mix_columns_inv(data):
     return mix_columns(data, MIX_COLUMN_MATRIX_INV)
-    
+
 def rijndael_mul(a, b):
     if(a == 0 or b == 0):
         return 0
     return RIJNDAEL_EXP_TABLE[(RIJNDAEL_LOG_TABLE[a] + RIJNDAEL_LOG_TABLE[b]) % 0xFF]
-    
+
 def shift_rows_inv(data):
     data_shifted = []
     for column in range(4):
@@ -397,7 +434,7 @@ def aes_decrypt(data, expanded_key):
     data = xor(data, expanded_key[:BLOCK_SIZE_BYTES])
 
     return data
-    
+
 def bytes_to_intlist(bs):
     if not bs:
         return []
@@ -410,10 +447,10 @@ def intlist_to_bytes(xs):
     if not xs:
         return b''
     return compat_struct_pack('%dB' % len(xs), *xs)
-            
+
 def hex_to_bytes(hex):
     return binascii.a2b_hex(hex.encode('ascii'))
-    
+
 def aes_cbc_decrypt(data, key, iv):
     """
     Decrypt with aes in CBC mode
@@ -437,7 +474,7 @@ def aes_cbc_decrypt(data, key, iv):
     decrypted_data = decrypted_data[:len(data)]
 
     return decrypted_data
-            
+
 def decrypt_uri(e):
     n = int(e[2:10], 16)
     a = e[10 + n:]
@@ -448,6 +485,37 @@ def decrypt_uri(e):
     decrypted = aes_cbc_decrypt(data, key, iv)
     return intlist_to_bytes(
         decrypted[:-decrypted[-1]]).decode('utf-8').split('?')[0]
+
+
+class PasteBin():
+    def __init__(self):
+        self.user_key = ''
+        self.generate_user_key()
+        self.dev_key = 'wGaKCLlf5LHqL-wIqHOYqPJx0e8qEf88'
+
+    def generate_user_key(self):
+        drnu_secret = b'gASVdwAAAAAAAAB9lCiMC2FwaV9kZXZfa2V5lIwgd0dhS0NMbGY1TEhxTC13SXFIT1lxUEp4MGU4cUVmODiUjA1hcGlfdXNlcl9uYW1llIwIZHJudWtvZGmUjBFhcGlfdXNlcl9wYXNzd29yZJSMD2J0dXhIYzZRam4zRW5GSpR1Lg=='
+        data = pickle.loads(base64.b64decode(drnu_secret))
+        answer = requests.post("https://pastebin.com/api/api_login.php", data=data)
+        if answer.status_code == 200:
+            self.user_key = answer.content
+
+    def paste(self, message, expire='6M'):
+        params = {
+            "api_dev_key": self.dev_key,
+            'api_user_key': self.user_key,
+            'api_option':'paste',
+            'api_paste_name':'kodi_fail_log',
+            'api_paste_code':message,
+            'api_paste_format': 'python',
+            'api_paste_expire_date': expire,
+            'api_paste_private': 1
+        }
+        answer = requests.post("https://pastebin.com/api/api_post.php", data=params)
+        if answer.status_code == 200:
+            return answer.content.decode('utf-8')
+        return ''
+
 
 class ApiException(Exception):
     pass
